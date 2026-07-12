@@ -141,3 +141,10 @@ dist
 vite.config.js.timestamp-*
 vite.config.ts.timestamp-*
 .vite/
+
+# Turborepo
+.turbo/
+
+# Foundry (packages/contracts also has its own .gitignore)
+packages/contracts/out/
+packages/contracts/cache/

@@ -1,0 +1,28 @@
+{
+  "name": "@stablerails/api",
+  "version": "0.1.0",
+  "private": true,
+  "type": "module",
+  "description": "StableRails API — Fastify host, tRPC surface, relayer and workers (scaffold)",
+  "scripts": {
+    "build": "tsc -p tsconfig.build.json",
+    "dev": "node --watch --experimental-strip-types src/index.ts",
+    "start": "node dist/index.js",
+    "test": "vitest run",
+    "lint": "eslint .",
+    "typecheck": "tsc --noEmit"
+  },
+  "dependencies": {
+    "@stablerails/core": "workspace:*",
+    "@trpc/server": "11.18.0",
+    "fastify": "5.10.0",
+    "zod": "4.4.3"
+  },
+  "devDependencies": {
+    "@stablerails/config": "workspace:*",
+    "@types/node": "22.20.1",
+    "eslint": "10.7.0",
+    "typescript": "5.9.3",
+    "vitest": "4.1.10"
+  }
+}

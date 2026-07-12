@@ -12,7 +12,7 @@
 | Area | State |
 |---|---|
 | Contracts, backend, ledger, queue, CCTP client, PIX client, frontend, CI | **Nothing exists.** Single commit: `README.md`, `LICENSE` (MIT), `.gitignore`. |
-| README | High quality and **binding**: fixes the mermaid architecture, stack table, chain choices (Base Sepolia settlement; Arbitrum/Ethereum Sepolia sources), monorepo layout (`apps/web`, `apps/api`, `packages/{contracts,ledger,cctp,pix,core,config}`), and a 10-item roadmap whose first item is the vertical slice. |
+| README | High quality and **binding** (provided with the project brief; the repo carried a 2-line stub until PR #1 installed the full version): fixes the mermaid architecture, stack table, chain choices (Base Sepolia settlement; Arbitrum/Ethereum Sepolia sources), monorepo layout (`apps/web`, `apps/api`, `packages/{contracts,ledger,cctp,pix,core,config}`), and a 10-item roadmap whose first item is the vertical slice. |
 | Contradictions with the brief | None material. Two ambiguities resolved in this plan: (1) "Fastify and/or tRPC" → **Fastify host + tRPC v11 router mounted via the Fastify adapter**, with plain Fastify routes for webhooks (OpenPix cannot call tRPC) — §2c. (2) "BullMQ for the async on-chain queue" vs. AI-DLH's proven Postgres-as-queue → **Postgres stays the system of record for payout state; BullMQ schedules/dispatches work** — §2c. |
 
 ### AI-DLH (`all/` — the reusable asset)

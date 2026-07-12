@@ -1,0 +1,28 @@
+{
+  "name": "@stablerails/core",
+  "version": "0.1.0",
+  "private": true,
+  "type": "module",
+  "description": "Shared kernel: branded money types (USDC 6dp / BRL centavos), FX conversion, correlation ids (UUIDv7 ↔ bytes32)",
+  "exports": {
+    ".": {
+      "types": "./dist/index.d.ts",
+      "default": "./dist/index.js"
+    }
+  },
+  "files": ["dist"],
+  "scripts": {
+    "build": "tsc -p tsconfig.build.json",
+    "test": "vitest run",
+    "lint": "eslint .",
+    "typecheck": "tsc --noEmit"
+  },
+  "devDependencies": {
+    "@stablerails/config": "workspace:*",
+    "@types/node": "22.20.1",
+    "eslint": "10.7.0",
+    "fast-check": "4.9.0",
+    "typescript": "5.9.3",
+    "vitest": "4.1.10"
+  }
+}
