@@ -1,0 +1,6 @@
+{
+  "name": "@stablerails/contracts",
+  "version": "0.1.0",
+  "private": true,
+  "description": "PayoutEscrow (Base Sepolia) — Foundry project. Built/tested by the dedicated Foundry CI job, not by turbo; run `forge build|test|fmt` directly."
+}

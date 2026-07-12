@@ -1,0 +1,15 @@
+{
+  "name": "@stablerails/config",
+  "version": "0.1.0",
+  "private": true,
+  "type": "module",
+  "description": "Shared tsconfig / eslint / prettier configuration for the StableRails monorepo",
+  "exports": {
+    "./eslint": "./eslint.config.base.mjs",
+    "./tsconfig.base.json": "./tsconfig.base.json"
+  },
+  "dependencies": {
+    "@eslint/js": "10.0.1",
+    "typescript-eslint": "8.63.0"
+  }
+}

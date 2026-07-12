@@ -1,0 +1,26 @@
+{
+  "name": "stablerails",
+  "version": "0.1.0",
+  "private": true,
+  "description": "B2B stablecoin payout rail — USDC in, BRL over PIX out, with provable books",
+  "license": "MIT",
+  "packageManager": "pnpm@10.33.0",
+  "engines": {
+    "node": ">=22 <23"
+  },
+  "scripts": {
+    "build": "turbo run build",
+    "test": "turbo run test",
+    "lint": "turbo run lint",
+    "typecheck": "turbo run typecheck",
+    "check": "turbo run lint typecheck test build",
+    "format": "prettier --write .",
+    "format:check": "prettier --check .",
+    "compose:up": "docker compose up -d",
+    "compose:down": "docker compose down"
+  },
+  "devDependencies": {
+    "prettier": "3.9.5",
+    "turbo": "2.10.4"
+  }
+}

@@ -1,0 +1,38 @@
+services:
+  postgres:
+    image: postgres:16-alpine
+    environment:
+      POSTGRES_USER: stablerails
+      POSTGRES_PASSWORD: stablerails
+      POSTGRES_DB: stablerails
+    ports:
+      - '5432:5432'
+    volumes:
+      - pgdata:/var/lib/postgresql/data
+    healthcheck:
+      test: ['CMD-SHELL', 'pg_isready -U stablerails -d stablerails']
+      interval: 5s
+      timeout: 3s
+      retries: 10
+
+  redis:
+    image: redis:7-alpine
+    ports:
+      - '6379:6379'
+    healthcheck:
+      test: ['CMD', 'redis-cli', 'ping']
+      interval: 5s
+      timeout: 3s
+      retries: 10
+
+  # Traces (Tempo), metrics (Prometheus), logs (Loki), dashboards (Grafana)
+  # in one local container. Grafana UI on http://localhost:3001 (API owns 3000).
+  otel-lgtm:
+    image: grafana/otel-lgtm:latest
+    ports:
+      - '3001:3000' # Grafana
+      - '4317:4317' # OTLP gRPC
+      - '4318:4318' # OTLP HTTP
+
+volumes:
+  pgdata:
