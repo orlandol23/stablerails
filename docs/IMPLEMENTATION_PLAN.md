@@ -1,5 +1,7 @@
 # StableRails — Implementation Plan
 
+> Corrections & hardening: see docs/PLAN-CORRECTIONS.md. Where it conflicts with this plan, it wins.
+
 > **Scope of this document.** StableRails' repo currently contains only the README (which fixes the architecture, stack, chains, and monorepo layout) and this plan. Everything below is therefore *delta*: the README's decisions are treated as settled contracts, not restated — where reality forced a refinement (e.g., BullMQ vs. the proven AI-DLH Postgres queue), the reconciliation is called out explicitly. The plan also inventories and reuses the sibling **AI-DLH** repo (`all` in this workspace), whose relayer/queue is the single biggest de-risking asset.
 >
 > **Conventions.** `⚠️ assumption` marks something you must confirm (all collected in §7). Facts about CCTP V2 and OpenPix below were verified against primary sources on 2026-07-11: Circle's official sample app ([circlefin/circle-cctp-crosschain-transfer](https://github.com/circlefin/circle-cctp-crosschain-transfer) — `chains.ts`, `use-cross-chain-transfer.ts`), Circle's `TokenMessengerV2.sol`/`MessageTransmitterV2.sol` sources, and the OpenPix docs repository ([Open-Pix/developers](https://github.com/Open-Pix/developers)).
@@ -135,7 +137,7 @@ flowchart TB
 1. **Create** — merchant calls `payout.create` (tRPC) with contractor + amount + client-supplied `Idempotency-Key`. API inserts `payouts` row (`state='created'`, unique on idempotency key), posts ledger transfer `merchant:receivable → escrow:incoming` (pending leg), returns `payoutId`. Root OTel span starts.
 2. **Fund** — merchant signs Permit (EIP-2612) for the escrow on Base Sepolia, or — cross-chain — approves/burns on Arbitrum/Ethereum Sepolia via `depositForBurn` (CCTP V2, §2b). Relayer submits `depositWithPermit` (gasless for merchant) or the CCTP orchestrator drives burn→attest→mint into the escrow. Escrow emits `Funded(payoutId, merchant, amount)`.
 3. **Record** — chain watcher confirms the deposit at N confirmations; ledger posts `escrow:onchain ← merchant:funded` (double entry, balanced); payout `state='funded'`.
-4. **Release** — relayer submits `release(payoutId, …)`; escrow transfers USDC to the settlement treasury address, emits `Released(payoutId, …)`; ledger moves `escrow:onchain → treasury:settlement`; `state='releasing'→'released'`.
+4. **Release** — relayer submits `releaseToTreasury(payoutId)`; escrow transfers USDC only to the contract-held settlement treasury (operator triggers, never redirects — A1), emits `Released(payoutId, …)`; ledger moves `escrow:onchain → treasury:settlement`; `state='releasing'→'released'`.
 5. **Pay out** — PIX worker calls OpenPix `POST /api/v1/payment` `{value: centavos, destinationAlias: pixKey, destinationAliasType, correlationID: payoutId}` (+ approve step, §2e); ledger posts `treasury:settlement → pix:in_flight` with the FX rate snapshotted on the transfer; `state='pix_submitted'`.
 6. **Confirm** — OpenPix fires `OPENPIX:MOVEMENT_CONFIRMED` webhook; HMAC verified; ledger posts `pix:in_flight → contractor:paid`; `state='settled'`. Root span ends; the whole rail is one trace.
 7. **Verify** — the reconciler independently recomputes `sum(ledger escrow accounts) == USDC.balanceOf(escrow)` and ledger↔OpenPix statement parity; emits `stablerails.invariant.drift == 0` metric.
@@ -147,7 +149,7 @@ Burn succeeded on Arbitrum Sepolia; attestation or mint never lands on Base Sepo
 - CCTP transfer rows carry their own state machine: `burn_submitted → burn_confirmed → attesting → attested → mint_submitted → minted`, each with an entered-at timestamp and a per-state SLA (attesting SLA: 60 s for Fast, 25 min for Standard; mint SLA: 5 min).
 - `AttestationPoller` polls `GET {IRIS}/v2/messages/{sourceDomain}?transactionHash={burnTx}` (404 → keep polling; `status:"complete"` → store `message`+`attestation`). Poll is a BullMQ repeatable job keyed by `payoutId` — restart-safe, at-least-once, dedup by job id.
 - **SLA breach** fires an alert (Grafana, on `stablerails.cctp.state_age_seconds`) and marks the transfer `stuck_attesting`/`stuck_minting` — *visible in the dashboard, threaded to the same trace via span links*.
-- **Recovery, in order**: (1) re-poll IRIS — attestations are re-fetchable at any time by burn tx hash; (2) re-submit `receiveMessage(message, attestation)` — idempotent on-chain: MessageTransmitterV2 rejects a used nonce, so a duplicate submission reverts harmlessly (caught as non-retryable "already processed" → advance state by reading the `MessageReceived` event); (3) if the mint tx itself is stuck, standard relayer RBF applies (§2c); (4) manual runbook: mint via Circle sample app / any EOA — `receiveMessage` is permissionless when `destinationCaller == bytes32(0)`; we set `destinationCaller` to the relayer ⚠️ assumption on the tradeoff, see §2b.
+- **Recovery, in order**: (1) re-poll IRIS — attestations are re-fetchable at any time by burn tx hash; (2) re-submit `receiveMessage(message, attestation)` — idempotent on-chain: MessageTransmitterV2 rejects a used nonce, so a duplicate submission reverts harmlessly (caught as non-retryable "already processed" → advance state by reading the `MessageReceived` event); (3) if the mint tx itself is stuck, standard relayer RBF applies (§2c); (4) manual runbook: mint via Circle sample app / any EOA — `receiveMessage` is permissionless because we set `destinationCaller = bytes32(0)` (decided, PLAN-CORRECTIONS B6; rationale in §2b). An externally-submitted mint is harmless: funds can only reach `mintRecipient` (the escrow), and the orchestrator verifies the on-chain mint event (net amount + recipient) before advancing state.
 - Funds are *never* ambiguous in the ledger: between burn and mint the amount sits in `cctp:in_transit` (an asset account); the invariant checker knows in-transit amounts are legitimately off-escrow.
 
 ### Failure path 2 — PIX payout failure & reconciliation
@@ -169,9 +171,15 @@ Burn succeeded on Arbitrum Sepolia; attestation or mint never lands on Base Sepo
 
 **Design.** One upgradeable contract on Base Sepolia holding all escrowed USDC, with per-payout accounting (not per-merchant pooled balances — per-payout is what makes the ledger↔chain mapping 1:1 and the release exactly-once):
 
-- `fundWithPermit(payoutId, merchant, amount, deadline, v, r, s)` — verifies EIP-2612 Permit ([EIP-2612](https://eips.ethereum.org/EIPS/eip-2612)) then `safeTransferFrom`; callable by `OPERATOR_ROLE` (the relayer executes; the *merchant* signed the Permit so custody-of-approval stays with them). Records `payouts[payoutId] = {merchant, amount, Funded}`; rejects a reused `payoutId` (**on-chain idempotency**).
-- `fundFromCCTP(payoutId, merchant, amount)` — operator attributes a CCTP mint that landed on the escrow address to a payout id (mint credits plain USDC; attribution is an explicit, evented step so the ledger never guesses). ⚠️ assumption: v1 keeps attribution trusted-operator; a stretch (§6) moves to CCTP V2 `depositForBurnWithHook` + on-chain hook validation.
-- `release(payoutId, to)` — `OPERATOR_ROLE`; requires state `Funded`; sets `Released` **before** transfer (CEI), `SafeERC20.safeTransfer`, emits `Released(payoutId, to, amount)`. A second call reverts `AlreadyReleased()` — the on-chain half of exactly-once.
+- `fundWithPermit(payoutId, merchant, amount, deadline, v, r, s)` — verifies EIP-2612 Permit ([EIP-2612](https://eips.ethereum.org/EIPS/eip-2612)) then `safeTransferFrom`; callable by `OPERATOR_ROLE` (the relayer executes; the *merchant* signed the Permit so custody-of-approval stays with them). Records `payouts[payoutId] = {merchant, amount, Funded}`; rejects a reused `payoutId` (**on-chain idempotency**). Front-run-proof permit handling (PLAN-CORRECTIONS B8):
+
+  ```solidity
+  try token.permit(owner, address(this), amount, deadline, v, r, s) {} catch {}
+  require(token.allowance(owner, address(this)) >= amount, "insufficient allowance");
+  token.safeTransferFrom(owner, address(this), amount);
+  ```
+- `fundFromCCTP(payoutId, merchant, amount)` — operator attributes a CCTP mint that landed on the escrow address to a payout id (mint credits plain USDC; attribution is an explicit, evented step so the ledger never guesses). Attribution is bound to the CCTP message (PLAN-CORRECTIONS A5): the DB enforces `UNIQUE(cctp_message_nonce, source_domain)` before the call, and the contract tracks `totalAttributedUnreleased`, asserting `totalAttributedUnreleased + amount <= usdc.balanceOf(address(this))` on every attribution — one mint can never be attributed twice nor attributed beyond real balance. The attributed `amount` is the **net minted amount** read from the on-chain mint event (Fast-transfer fee is deducted at mint — A4). ⚠️ assumption: v1 keeps attribution trusted-operator; a stretch (§6) moves to CCTP V2 `depositForBurnWithHook` + on-chain hook validation.
+- `releaseToTreasury(payoutId)` — `OPERATOR_ROLE`; requires state `Funded`; sets `Released` **before** transfer (CEI), `SafeERC20.safeTransfer` **only to the settlement treasury address held by the contract** (set by `ADMIN_ROLE`, timelock-ready — never an operator-supplied argument), emits `Released(payoutId, treasury, amount)`. A second call reverts `AlreadyReleased()` — the on-chain half of exactly-once. A stolen operator key can *trigger* a release to treasury, never *redirect* funds (PLAN-CORRECTIONS A1).
 - `refund(payoutId)` — returns funds to the merchant (PIX-failure compensation path), same CEI/idempotency discipline.
 - Roles via OZ `AccessControl`: `DEFAULT_ADMIN_ROLE` (multisig-ready; testnet = deployer), `OPERATOR_ROLE` (relayer), `PAUSER_ROLE`; `Pausable` gates fund/release (circuit breaker — triggered by the invariant alert, §2h).
 - Upgradeability: **UUPS** (`UUPSUpgradeable`, [ERC-1967](https://eips.ethereum.org/EIPS/eip-1967)) with `_authorizeUpgrade` gated on `UPGRADER_ROLE`, OZ v5.x upgradeable variants, initializer + `_disableInitializers()` in the implementation constructor.
@@ -205,7 +213,7 @@ Burn succeeded on Arbitrum Sepolia; attestation or mint never lands on Base Sepo
 | A2 | Fork test funds via real testnet-USDC permit signature and releases; gas snapshot committed |
 | A3 | Storage-layout diff job fails CI on incompatible upgrade; a deliberate bad upgrade is demonstrated blocked in a test |
 | A4 | 100% of external functions have revert-path tests; slither reports no high/medium (or triaged inline) |
-| A5 | `sum(ledger)==escrow` expressible: contract exposes `totalAttributed()` view used by the reconciler |
+| A5 | Invariant expressible: contract exposes `totalAttributedUnreleased()` view used by the reconciler (see §2d three-check invariant) |
 
 **Test strategy.** Unit/fuzz (forge) → invariant (handler-based, ghost accounting) → fork (Base Sepolia, real USDC + permit) → the cross-system invariant lives in §2d/§2l harnesses. Mutation-style spot checks: comment out the CEI ordering and confirm the invariant suite fails (documents that the tests bite).
 
@@ -216,7 +224,7 @@ Burn succeeded on Arbitrum Sepolia; attestation or mint never lands on Base Sepo
 | Upgrade bricking (bad `_authorizeUpgrade`, storage collision) | UUPS tests + storage-layout CI gate + `_disableInitializers`; runbook: upgrades only via script with `--sig` dry-run on fork |
 | Permit domain mismatch on testnet USDC (EIP-712 domain `version` differs) | Fork test C5 reads `DOMAIN_SEPARATOR`/`version()` from the real token; never hardcode |
 | Reentrancy on release/refund | USDC is a known token (no hooks), but CEI + `nonReentrant` anyway — defense in depth is the reviewer signal |
-| Unattributed direct transfers skewing the invariant | `totalAttributed()` vs `balanceOf` split; `skim()`; invariant uses attributed sum |
+| Unattributed direct transfers skewing the invariant | `totalAttributedUnreleased()` vs `balanceOf` split; `skim()`; invariant uses attributed sum (§2d checks 2–3) |
 
 ### 2b. Cross-chain settlement — CCTP V2
 
@@ -240,7 +248,7 @@ Flow (per [Circle CCTP docs](https://developers.circle.com/cctp) and the verifie
 |---|---|---|
 | Fast vs. Standard | **Fast by default** (`minFinalityThreshold=1000`), auto-fallback to Standard above a configurable amount (default 1,000 USDC) | Fast ≈ sub-30 s (soft finality; small USDC fee deducted from mint via `maxFee`) vs. 13–19 min hard finality — demo UX demands Fast; the amount threshold demonstrates you understand the reorg-risk/fee tradeoff rather than always paying for speed |
 | Who submits the mint | **Our relayer** (portfolio requirement: show the full burn→attest→mint loop), behind `interface AttestationProvider { getAttestation(burnTx): Promise<Attested> }` and `interface MintSubmitter { submitMint(msg, att): Promise<TxRef> }` | The seam is exactly where [Circle's Forwarding Service](https://developers.circle.com/cctp) plugs in later (it fetches attestations and submits destination mints with gas + retries, no new contracts) — swap the two implementations, delete no orchestration code. Documented as the productionization path |
-| `destinationCaller` | Set to relayer address | Prevents third parties griefing state by minting "for us" out-of-order; cost: loses the "anyone can rescue-mint" property, so the manual runbook uses the relayer key explicitly. ⚠️ assumption: acceptable; flip to `bytes32(0)` if rescue-by-any-EOA is preferred |
+| `destinationCaller` | **`bytes32(0)`** (decided — PLAN-CORRECTIONS B6) | Circle enforces `destinationCaller` strictly: pinning it to our relayer would forfeit rescue-mint by any EOA **and** break the Forwarding Service seam (Circle's service submits the mint in that model). The "third party mints for us out-of-order" concern is neutralized by verify-don't-assume (B7): on any externally-completed mint the orchestrator reads the mint event (net amount + recipient) before advancing state — funds can only ever reach `mintRecipient` = the escrow |
 | Burn signer | **Merchant wallet** signs approve+burn on the source chain (wagmi flow copied from Circle's sample hook) | Keeps custody honest: StableRails never holds source-chain funds; relayer only pays destination gas. Tradeoff: two merchant signatures (approve, burn) on source chain — acceptable; gasless-everywhere is the §6 roadmap |
 | V1 vs V2 | V2 only | V1 is legacy, phasing out from Jul 31 2026 (brief-verified); V2 is canonical and adds `maxFee`/`minFinalityThreshold`/hooks |
 
@@ -291,12 +299,14 @@ Flow (per [Circle CCTP docs](https://developers.circle.com/cctp) and the verifie
 | Property | AI-DLH | StableRails |
 |---|---|---|
 | Library | ethers v6 | **viem 2.x** (`WalletClient` + `publicClient`); `waitForTransactionReceipt` has first-class `onReplaced` (repriced/cancelled detection) which replaces the hand-rolled `TRANSACTION_REPLACED` handling |
-| Concurrency | sequential, implicit | **concurrency=1 per chain** (BullMQ per-chain queue), explicit; nonce = `getTransactionCount(pending)` under a per-chain mutex; a persisted `nonce_journal` detects gaps after crashes |
+| Nonce allocation | ethers auto-nonce, safe only because strictly sequential in one process | **Postgres nonce allocator** (PLAN-CORRECTIONS A3): `relayer_nonces(chain_id, signer, next_nonce)`, claimed via `SELECT … FOR UPDATE` in the **same transaction** that journals the tx intent — distributed-safe by construction, not by queue configuration. BullMQ stays at concurrency=1 per (chain, signer) as a throughput/ordering choice, never the correctness mechanism. `getTransactionCount(pending)` is read **only** during a paused disaster-recovery resync. Full design: `docs/design/relayer.md` |
 | Crash double-submit window | tx sent, then DB write | **journal-before-broadcast**: sign locally (`signTransaction`), compute hash (`keccak256(signedTx)`), persist `{payoutId, chain, nonce, hash, raw}` to `tx_journal`, *then* `sendRawTransaction`. On crash-recovery the journal is replayed: re-broadcasting an already-mined raw tx is a no-op ("already known"/nonce-too-low → look up receipt by hash) |
-| RBF | +25% fees, same nonce, on 90 s timeout | Same policy (satisfies the ≥10% node minimum with margin), same-nonce re-sign via the journal; bump ceiling (max 3 bumps) then park `stuck` + alert |
+| Fee policy + RBF | +25% bump only; initial fees left to ethers defaults | **Explicit EIP-1559 policy** (PLAN-CORRECTIONS A6): first attempt priced from live data (`eth_feeHistory` priority percentile + base-fee headroom, per-chain caps); replacement `maxFee' = max(currentBaseFee + bumpedPriority, oldMaxFee × 1.25)` — bumping a *stale* `maxFee` during a base-fee spike can never mine, so replacements re-read the market. Same-nonce re-sign via the journal; ceiling (max 3 replacements) then park `stuck` + alert. Fee-estimation failure alerts **separately** from replacement exhaustion (different failure domains) |
 | Finality | 1 confirmation | Configurable per chain/action: releases at N=2 on Base Sepolia; ledger postings only after confirmation depth ⚠️ assumption: 2 is enough for testnet demo; document mainnet would use more |
 | Error taxonomy | CALL_EXCEPTION non-retryable; funds/network retryable | Ported 1:1 onto viem error types (`ContractFunctionRevertedError` → non-retryable; `InsufficientFundsError` retryable + wallet-monitor alert; RPC/timeouts retryable) |
 | Signer tests | none | The signer state machine gets its own vitest suite against **anvil** (kill/restart, stuck-tx via `anvil_setNextBlockBaseFeePerGas` abuse, nonce-gap injection) |
+
+**Provider-operation journal (outbox) — the off-chain twin of journal-before-broadcast (PLAN-CORRECTIONS A2).** Every external state-changing call (OpenPix `POST /payment`, `POST /payment/approve`, CCTP mint submission) first commits an outbox row — `provider_operations(payout_id, provider, operation, correlation_id, status='unknown')` — in its own transaction. If the worker crashes after the provider accepted the call but before the outcome is recorded, the retry finds the `unknown` row and **must query provider state first** (`GET /payment/{correlationID}`; a chain read for CCTP) before ever re-POSTing — a blind duplicate call is structurally impossible, not just unlikely. Detail: `docs/design/relayer.md`.
 
 **Idempotency keys end-to-end**: client-supplied `Idempotency-Key` unique-indexed on `payouts`; `payoutId` unique in every downstream table; BullMQ deterministic job ids; on-chain `payoutId` replay guard; OpenPix `correlationID`. Each layer is tested to swallow duplicates (§2l).
 
@@ -307,8 +317,8 @@ Flow (per [Circle CCTP docs](https://developers.circle.com/cctp) and the verifie
 | ID | Task | Est. |
 |---|---|---|
 | R1 | `apps/api` scaffold: Fastify v5 + tRPC v11 adapter, zod env (AI-DLH pattern), pino logger w/ trace ids, healthz/readyz | 0.5 w |
-| R2 | State-machine tables + claim helpers (`FOR UPDATE SKIP LOCKED` batch claim + conditional-UPDATE single claim) with property tests for double-claim | 1 w |
-| R3 | `TxSubmitter` (viem): journal-before-broadcast, per-chain mutex nonce, RBF w/ `onReplaced`, error taxonomy; anvil test suite | 1.5 w |
+| R2 | State-machine tables + claim helpers (`FOR UPDATE SKIP LOCKED` batch claim + conditional-UPDATE single claim) + `provider_operations` outbox (A2), with property tests for double-claim | 1 w |
+| R3 | `TxSubmitter` (viem): journal-before-broadcast, Postgres nonce allocator (A3), EIP-1559 fee policy + RBF (A6), error taxonomy; anvil test suite | 1.5 w |
 | R4 | BullMQ wiring: queues (`tx.base`, `tx.src`, `cctp.attest`, `pix.submit`, `reconcile`), deterministic job ids, janitor, graceful shutdown | 1 w |
 | R5 | Payout tRPC router + idempotency-key handling + status endpoint (correlation-id lookup) | 0.5 w |
 | R6 | Wallet monitor (port of AI-DLH) → OTel gauge + alert, per chain | 0.5 w |
@@ -340,7 +350,7 @@ Flow (per [Circle CCTP docs](https://developers.circle.com/cctp) and the verifie
 
 Schema (Drizzle):
 
-- `ledger_accounts(id, code unique, currency ∈ {USDC, BRL}, type ∈ {asset, liability, income, expense}, normal_side)`. Chart of accounts (v1): `merchant:{id}:funded` (liability — we owe the merchant's payout), `escrow:onchain` (asset — USDC in the contract), `cctp:in_transit` (asset), `treasury:settlement` (asset), `pix:in_flight` (asset, BRL side after conversion), `contractor:{id}:paid` (settled liability sink), `fees:revenue` (income), `fx:usdc_brl` (conversion bridge, §below).
+- `ledger_accounts(id, code unique, currency ∈ {USDC, BRL}, type ∈ {asset, liability, income, expense}, normal_side)`. Chart of accounts (v1): `merchant:{id}:funded` (liability — we owe the merchant's payout), `escrow:onchain` (asset — USDC in the contract), `cctp:in_transit` (asset), `cctp:circle_fee` (expense — Fast-transfer fee deducted by Circle at mint, A4), `treasury:settlement` (asset), `pix:in_flight` (asset, BRL side after conversion), `contractor:{id}:paid` (settled liability sink), `fees:revenue` (income), `fx:usdc_brl` (conversion bridge, §below).
 - `ledger_transfers(id uuidv7, payout_id, kind, fx_rate numeric(18,8) nullable, created_at)` — one business movement.
 - `ledger_entries(id, transfer_id, account_id, direction ∈ {debit, credit}, amount numeric(20,0) /* minor units */, currency)` with:
   - CHECK `amount > 0`;
@@ -350,13 +360,14 @@ Schema (Drizzle):
 
 **FX handling (USDC→BRL), explicit and honest**: sandbox PIX is fake BRL, and StableRails does not run a real FX book. At `pix.submit` time a `QuoteProvider` (v1: fixed-rate stub with the seam; the rate is snapshotted onto the transfer) converts; the posting is two balanced legs through `fx:usdc_brl`: `treasury:settlement (USDC) → fx:usdc_brl (USDC)` and `fx:usdc_brl (BRL) → pix:in_flight (BRL)`. The `fx:usdc_brl` account's per-currency balances make conversion exposure *visible* rather than hidden — and the seam is where a production liquidity provider (OTC desk / exchange) would plug in. ⚠️ assumption: fixed demo rate acceptable; alternative is a free FX feed (e.g., exchangerate.host) behind the same seam.
 
-**The invariant, continuously verified.** `Reconciler` (BullMQ repeatable, every 60 s + on-demand):
+**The invariant — three strict checks, continuously verified (PLAN-CORRECTIONS B2).** `Reconciler` (BullMQ repeatable, every 60 s + on-demand):
 
-1. Pick a Base Sepolia block `B` (latest − confirmation depth).
-2. On-chain: `usdc.balanceOf(escrow)` and `escrow.totalAttributed()` **at block B** (viem `blockNumber` param).
-3. Ledger: `balance(escrow:onchain)` *as of* the last posting whose confirming block ≤ B (entries carry the confirming tx's block for on-chain-driven postings).
-4. Assert equality (attributed) and `balanceOf ≥ attributed` (dust); emit `stablerails.ledger.invariant_drift` (gauge, expected 0) + `stablerails.ledger.last_verified_block`.
-5. **On drift**: alert (page), auto-**pause** new releases (flip a `system_flags` row the release worker honors; optionally `pause()` on-chain), and write a `reconciliation_incidents` row with both sides' snapshots. Drift is a *stop-the-line* event, never a log line.
+1. **Block anchoring:** pin one Base Sepolia block `B` at confirmation depth and record its **`blockHash`** — every read below (chain *and* ledger cutoff) is anchored to that hash, never to a "latest" number, so a reorg cannot manufacture false drift. Ledger entries driven by on-chain events store the confirming tx's block hash+number for exactly this cutoff.
+2. **Attribution (strict equality):** `ledger.balance(escrow:onchain) == escrow.totalAttributedUnreleased()` at block `B`.
+3. **Solvency (dust-tolerant):** `usdc.balanceOf(escrow) >= escrow.totalAttributedUnreleased()` at block `B`; the delta is tracked explicitly as unattributed dust (direct transfers) with its own gauge — never silently absorbed.
+4. **Net-fee correctness (A4):** CCTP Fast-transfer fees are deducted by Circle **at mint** — the escrow receives `amount − fee`. Attribution and ledger postings are driven by the **actual net minted amount read from the on-chain mint event**, never the requested burn amount; the fee posts to `cctp:circle_fee`. Without this split the invariant would drift on the very first Fast transfer.
+5. Emit `stablerails.ledger.invariant_drift` (gauge, expected 0), `stablerails.ledger.unattributed_dust`, `stablerails.ledger.last_verified_block`.
+6. **On drift**: alert (page), auto-**pause** new releases (flip a `system_flags` row the release worker honors; optionally `pause()` on-chain), and write a `reconciliation_incidents` row with both sides' snapshots. Drift is a *stop-the-line* event, never a log line.
 
 Also reconciled: ledger `pix:in_flight`/`contractor:paid` vs. OpenPix payment statuses (poll sweep, §2e), and `cctp:in_transit` vs. IRIS/mint states.
 
@@ -364,7 +375,10 @@ Also reconciled: ledger `pix:in_flight`/`contractor:paid` vs. OpenPix payment st
 
 | Event | Debit | Credit |
 |---|---|---|
-| Funding attributed on-chain | `escrow:onchain` +a | `merchant:{id}:funded` +a |
+| Funding — direct Permit on Base (no CCTP) | `escrow:onchain` +a | `merchant:{id}:funded` +a |
+| Funding — CCTP burn observed (gross `g`) | `cctp:in_transit` +g | `merchant:{id}:funded` +g |
+| Funding — CCTP mint + attribution (fee `f`, net `a = g − f`; replaces the Permit row for this path, per A4) | `escrow:onchain` +a · `cctp:circle_fee` +f | `cctp:in_transit` −g |
+| Circle fee passed through to merchant (default policy, keeps liability = escrowed net) | `merchant:{id}:funded` −f | `fees:revenue` +f |
 | Release to treasury | `treasury:settlement` +a | `escrow:onchain` −a |
 | PIX submit (post-FX) | `pix:in_flight` (BRL leg) | `treasury:settlement` (USDC leg) via `fx:usdc_brl` |
 | PIX confirmed | `contractor:{id}:paid` | `pix:in_flight` |
@@ -560,7 +574,7 @@ Also reconciled: ledger `pix:in_flight`/`contractor:paid` vs. OpenPix payment st
 
 | # | Threat | Mitigation |
 |---|---|---|
-| T1 | Operator key theft → drain escrow via `release` | Escrow only ever releases to configured treasury/merchant addresses (per-payout `to` constrained on-chain to the payout's recorded parties ⚠️ design detail to finalize in C2); Pausable + admin role separation; KMS path removes raw key from servers; balance alarms |
+| T1 | Operator key theft → drain escrow via release | Escrow releases **only** to the contract-held treasury (`releaseToTreasury`, PLAN-CORRECTIONS A1) or refunds to the payout's recorded merchant — no operator-supplied recipient exists on any path; Pausable + admin role separation; KMS path removes raw key from servers; balance alarms |
 | T2 | Forged/replayed OpenPix webhook → fake "settled" ledger entries | HMAC-SHA1 over raw body + `timingSafeEqual`; event-id dedup table; polling backstop cross-checks provider truth; IP allowlist as secondary |
 | T3 | Replayed/duplicated payout requests (client or internal retries) | Idempotency-Key unique index; deterministic job ids; on-chain `payoutId` guard; §2l duplicate-storm test |
 | T4 | Permit signature phishing (merchant signs a permit for attacker spender) | Frontend displays token/spender/amount human-readably; permit scoped per payout amount, short deadline; escrow is the only spender the UI ever requests |
@@ -749,8 +763,8 @@ Decisions: tRPC client end-to-end types (no codegen); TanStack Query v5 (wagmi p
 
 1. ⚠️ **OpenPix sandbox payout enablement** — does the sandbox account get `/api/v1/payment` access via support chat, and does sandbox settlement fire `OPENPIX:MOVEMENT_CONFIRMED`? (Risk #1; fallback ladder §2e.)
 2. ⚠️ **Base Sepolia USDC permit domain** — confirm `version()`/`DOMAIN_SEPARATOR` on `0x036C…F7e` behaves as FiatTokenV2_2 (fork test C5 answers this in week 1 of contracts work).
-3. ⚠️ **`destinationCaller` policy** — relayer-only mint (anti-griefing) vs `bytes32(0)` (anyone-can-rescue). Plan assumes relayer-only.
-4. ⚠️ **Escrow `release(to)` constraint** — release strictly to a single configured treasury (simplest, planned) vs per-payout recipients. Decide at C2.
+3. ~~`destinationCaller` policy~~ **DECIDED** (PLAN-CORRECTIONS B6): `bytes32(0)` — any-EOA rescue + Forwarding Service compatibility, with external/duplicate mints verified against the mint event (B7).
+4. ~~Escrow release constraint~~ **DECIDED** (PLAN-CORRECTIONS A1): `releaseToTreasury(payoutId)` only; treasury address is contract-held, `ADMIN_ROLE`-set, timelock-ready.
 5. ⚠️ **Demo FX**: fixed rate (planned) vs live feed.
 6. ⚠️ **Deploy target** for the API demo (Railway assumed, configs portable from AI-DLH) vs local-only demo.
 
